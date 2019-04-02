@@ -17,7 +17,6 @@ func TestExistenceError(t *testing.T) {
 
 	for _, x := range []error{
 		newZoneError("example.net."),
-		newNodeError("www.example.net."),
 	} {
 		if x.Error() == "" {
 			t.Error(x)

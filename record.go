@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package dns
+package indns
 
 import (
 	"net"
@@ -46,9 +46,18 @@ func (RecordNS) Type() RecordType   { return TypeNS }
 func (RecordTXT) Type() RecordType  { return TypeTXT }
 func (RecordAAAA) Type() RecordType { return TypeAAAA }
 
-// Records contains Record*-type items (values, not pointers).  There must not
-// be more than one item of a given type.
+// Records contains Record*-type items (values, not pointers).
 type Records []Record
+
+func (rs Records) Addressable() bool {
+	for _, r := range rs {
+		switch r.Type() {
+		case TypeA, TypeAAAA:
+			return true
+		}
+	}
+	return false
+}
 
 func (rs Records) DeepCopy() Records {
 	clone := make(Records, len(rs))

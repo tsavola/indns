@@ -9,10 +9,10 @@ import (
 	"net"
 	"testing"
 
-	dnsclient "github.com/miekg/dns"
-	"github.com/tsavola/acmedns/dns"
-	"github.com/tsavola/acmedns/dns/dnsserver"
-	"github.com/tsavola/acmedns/dns/dnszone"
+	"github.com/miekg/dns"
+	"github.com/tsavola/indns"
+	"github.com/tsavola/indns/dnsserver"
+	"github.com/tsavola/indns/dnszone"
 )
 
 const (
@@ -20,20 +20,19 @@ const (
 )
 
 func TestServer(t *testing.T) {
-	config := &dnsserver.Config{
-		Addr:  addr,
-		Ready: make(chan struct{}),
+	config := dnsserver.Config{
+		Addr: addr,
 	}
 
 	orgZone := &dnszone.Zone{
 		Domain: "example.org.",
-		Nodes: map[string]dns.Records{
-			dns.Apex: dns.Records{
-				dns.RecordA{
+		Nodes: map[string]indns.Records{
+			indns.Apex: indns.Records{
+				indns.RecordA{
 					Value: net.ParseIP("93.184.216.34"),
 					TTL:   1,
 				},
-				dns.RecordAAAA{
+				indns.RecordAAAA{
 					Value: net.ParseIP("2606:2800:220:1:248:1893:25c8:1946"),
 					TTL:   1,
 				},
@@ -47,25 +46,28 @@ func TestServer(t *testing.T) {
 
 	zones := dnszone.Init(orgZone, comZone)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
+
+	server := dnsserver.Server{
+		Ready: make(chan struct{}),
+	}
 
 	served := make(chan error, 1)
 
 	go func() {
 		defer close(served)
-		served <- dnsserver.Serve(ctx, zones, config)
+		served <- server.Serve(zones, config)
 	}()
 
-	<-config.Ready
+	<-server.Ready
 
-	client := &dnsclient.Client{
+	client := &dns.Client{
 		Net: "tcp",
 	}
 
 	for i, name := range []string{"_acme-challenge.example.org.", "example.org.", "www.example.com.", "www.example.net."} {
-		for j, typ := range []uint16{dnsclient.TypeA, dnsclient.TypeAAAA, dnsclient.TypeTXT} {
-			msg := new(dnsclient.Msg)
+		for j, typ := range []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeTXT} {
+			msg := new(dns.Msg)
 			msg.SetQuestion(name, typ)
 
 			in, _, err := client.Exchange(msg, addr)
@@ -76,9 +78,9 @@ func TestServer(t *testing.T) {
 			}
 
 			if i == 0 && j == 0 {
-				go zones.ModifyTXTRecord(ctx, "example.org.", "_acme-challenge", []string{"asdf"}, 1)
+				go zones.ModifyTXTRecord(ctx, "_acme-challenge.example.org.", []string{"asdf"}, 1)
 
-				err = zones.ModifyTXTRecord(ctx, "example.org.", "_acme-challenge", []string{"qwerty"}, 2)
+				err = zones.ModifyTXTRecord(ctx, "_acme-challenge.example.org.", []string{"qwerty"}, 2)
 				if err != nil {
 					t.Error(err)
 				}
@@ -86,9 +88,11 @@ func TestServer(t *testing.T) {
 		}
 	}
 
-	cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
 
-	if err := <-served; err != nil && err != context.Canceled {
+	if err := <-served; err != nil {
 		t.Fatal(err)
 	}
 }

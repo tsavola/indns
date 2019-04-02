@@ -12,44 +12,78 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/miekg/dns"
-	naming "github.com/tsavola/acmedns/dns"
+	"github.com/tsavola/indns"
 )
 
 const (
-	// Serial number used for negative answers.
-	defaultSerial = 1
+	defaultAddr = ":53"
 )
 
 // Config of DNS server.
 type Config struct {
-	Addr  string // Defaults to ":dns"
+	// Addr defaults to ":53".  If a hostname is specified, all IP addresses it
+	// resolves to will be listened on.
+	Addr string
+
 	NoTCP bool
 	NoUDP bool
 
 	ErrorLog Logger // Defaults to log package's standard logger
 	DebugLog Logger // Defaults to nothingness
 
-	// If provided, this channel will be closed once all listeners are ready.
-	Ready chan struct{}
-
 	// If the NS field of SOA is set, the name server will be authoritative and
 	// NS and SOA records are returned.
 	SOA SOA
 }
 
-// Serve DNS requests for the duration of the context.  Resolver implementation
-// effectively defines the zones.  Configuration is optional.
-func Serve(ctx context.Context, resolver Resolver, serverConfig *Config) (err error) {
-	var config Config
+// Serve DNS requests.  Resolver implementation effectively defines the zones.
+func Serve(resolver Resolver, config Config) error {
+	return new(Server).Serve(resolver, config)
+}
 
-	if serverConfig != nil {
-		config = *serverConfig
+// Server of DNS requests.
+type Server struct {
+	// If provided by the user, this channel will be closed once all listeners
+	// are ready.
+	Ready chan struct{}
+
+	lock sync.Mutex
+	stop chan struct{}
+	done chan struct{}
+}
+
+// Serve DNS requests until Shutdown is called.  Resolver implementation
+// effectively defines the zones.
+func (s *Server) Serve(resolver Resolver, config Config) (err error) {
+	s.lock.Lock()
+	stop := s.stop
+	done := s.done
+	start := stop == nil
+	if start {
+		stop = make(chan struct{})
+		done = make(chan struct{})
+		s.stop = stop
+		s.done = done
 	}
+	s.lock.Unlock()
+	if !start {
+		return
+	}
+	defer close(done)
 
 	if config.ErrorLog == nil {
 		config.ErrorLog = defaultLogger{}
+	}
+
+	if config.Addr == "" {
+		config.Addr = defaultAddr
+	}
+	host, port, err := net.SplitHostPort(config.Addr)
+	if err != nil {
+		return
 	}
 
 	err = config.SOA.init()
@@ -61,54 +95,95 @@ func Serve(ctx context.Context, resolver Resolver, serverConfig *Config) (err er
 		handle(w, m, resolver, &config.SOA, config.ErrorLog, config.DebugLog)
 	})
 
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	errors := make(chan error, 4) // (tcp, udp) x (context, listener)
+	wait := func() {
+		select {
+		case <-stop:
+		case <-ctx.Done():
+		}
+	}
 
-	if !config.NoTCP {
-		var l net.Listener
-
-		l, err = net.Listen("tcp", config.Addr)
+	var addrs []string
+	if host == "" {
+		addrs = []string{host}
+	} else {
+		addrs, err = new(net.Resolver).LookupHost(ctx, host)
 		if err != nil {
 			return
 		}
-
-		go func() {
-			defer l.Close()
-			<-ctx.Done()
-			errors <- ctx.Err()
-		}()
-
-		go func() {
-			errors <- dns.ActivateAndServe(l, nil, handler)
-		}()
+	}
+	for i, host := range addrs {
+		addrs[i] = net.JoinHostPort(host, port)
 	}
 
-	if !config.NoUDP {
-		var pc net.PacketConn
+	errors := make(chan error, 2*2*len(addrs)) // (tcp, udp) x (wait, listen) x addrs
 
-		pc, err = net.ListenPacket("udp", config.Addr)
-		if err != nil {
-			return
+	for _, addr := range addrs {
+		addr := addr
+
+		if !config.NoTCP {
+			var l net.Listener
+
+			l, err = net.Listen("tcp", addr)
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer l.Close()
+				wait()
+				errors <- nil
+			}()
+
+			go func() {
+				errors <- dns.ActivateAndServe(l, nil, handler)
+			}()
 		}
 
-		go func() {
-			defer pc.Close()
-			<-ctx.Done()
-			errors <- ctx.Err()
-		}()
+		if !config.NoUDP {
+			var pc net.PacketConn
 
-		go func() {
-			errors <- dns.ActivateAndServe(nil, pc, handler)
-		}()
+			pc, err = net.ListenPacket("udp", addr)
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer pc.Close()
+				wait()
+				errors <- nil
+			}()
+
+			go func() {
+				errors <- dns.ActivateAndServe(nil, pc, handler)
+			}()
+		}
 	}
 
-	if config.Ready != nil {
-		close(config.Ready)
+	if s.Ready != nil {
+		close(s.Ready)
 	}
 
 	err = <-errors
+	return
+}
+
+// Shutdown the server.  Serve call will return.
+func (s *Server) Shutdown(ctx context.Context) (err error) {
+	s.lock.Lock()
+	stop := s.stop
+	done := s.done
+	if stop == nil {
+		stop = make(chan struct{})
+		s.stop = stop
+	}
+	s.lock.Unlock()
+	close(stop)
+	if done != nil {
+		<-done
+	}
 	return
 }
 
@@ -143,7 +218,7 @@ func handle(w dns.ResponseWriter, questMsg *dns.Msg, resolver Resolver, soa *SOA
 		return
 	}
 
-	q := questMsg.Question[0]
+	q := &questMsg.Question[0]
 
 	if q.Qclass != dns.ClassINET {
 		replyCode = dns.RcodeNotImplemented
@@ -154,40 +229,33 @@ func handle(w dns.ResponseWriter, questMsg *dns.Msg, resolver Resolver, soa *SOA
 		debugLog.Printf("dnsserver: %v %s %q", w.RemoteAddr(), dns.TypeToString[q.Qtype], q.Name)
 	}
 
-	replyMsg.Authoritative = soa.authority()
-
 	var (
+		zone    string
+		qIsApex bool
+		nodes   []indns.NodeRecords
 		serial  uint32
-		nodes   []naming.NodeRecords
-		hasApex bool
 	)
 
-	if transferReq(&q) {
+	if transferReq(q) {
 		if soa.authority() {
 			nodes, serial = resolver.TransferZone(strings.ToLower(q.Name))
-			hasApex = true
-
-			replyMsg.Answer = append(replyMsg.Answer, soaAnswer(&q, soa, serial))
-			replyMsg.Answer = append(replyMsg.Answer, &dns.NS{
-				Hdr: dns.RR_Header{
-					Name:   q.Name,
-					Rrtype: dns.TypeNS,
-					Class:  dns.ClassINET,
-					Ttl:    soa.TTL,
-				},
-				Ns: soa.NS,
-			})
+			if serial != 0 {
+				zone = q.Name
+				qIsApex = true
+				replyMsg.Authoritative = true
+				replyMsg.Answer = append(replyMsg.Answer, soaAnswer(q.Name, soa, serial))
+				replyMsg.Answer = append(replyMsg.Answer, nsAnswer(q.Name, soa.NS, soa.TTL))
+			}
 		}
 	} else {
-		var (
-			node string
-			rs   naming.Records
-		)
+		var nr indns.NodeRecords
 
-		node, rs, serial = resolver.ResolveRecords(strings.ToLower(q.Name), naming.RecordType(q.Qtype))
-		if node != "" {
-			nodes = []naming.NodeRecords{{Name: node, Records: rs}}
-			hasApex = (node == naming.Apex)
+		zone, nr.Name, nr.Records, serial = resolver.ResolveRecords(strings.ToLower(q.Name), indns.RecordType(q.Qtype))
+		if zone != "" {
+			zone = q.Name[len(q.Name)-len(zone):] // Preserve case.
+			qIsApex = (nr.Name == indns.Apex)
+			nodes = []indns.NodeRecords{nr}
+			replyMsg.Authoritative = soa.authority()
 		}
 	}
 
@@ -196,14 +264,14 @@ func handle(w dns.ResponseWriter, questMsg *dns.Msg, resolver Resolver, soa *SOA
 			var name string
 
 			switch node.Name {
-			case naming.Apex:
+			case indns.Apex:
 				name = q.Name
 
-			case naming.Wildcard:
+			case indns.Wildcard:
 				name = "*." + q.Name
 
 			default:
-				if hasApex {
+				if qIsApex {
 					name = node.Name + "." + q.Name
 				} else {
 					name = q.Name
@@ -212,23 +280,15 @@ func handle(w dns.ResponseWriter, questMsg *dns.Msg, resolver Resolver, soa *SOA
 
 			for _, x := range node.Records {
 				switch t := x.Type(); t {
-				case naming.TypeNS:
-					if replyType(&q, dns.TypeNS) {
-						r := x.(naming.RecordNS)
-						replyMsg.Answer = append(replyMsg.Answer, &dns.NS{
-							Hdr: dns.RR_Header{
-								Name:   name,
-								Rrtype: dns.TypeNS,
-								Class:  dns.ClassINET,
-								Ttl:    r.TTL,
-							},
-							Ns: r.Value,
-						})
+				case indns.TypeNS:
+					if replyType(q, dns.TypeNS) {
+						r := x.(indns.RecordNS)
+						replyMsg.Answer = append(replyMsg.Answer, nsAnswer(name, r.Value, r.TTL))
 					}
 
-				case naming.TypeA:
-					if replyType(&q, dns.TypeA) {
-						r := x.(naming.RecordA)
+				case indns.TypeA:
+					if replyType(q, dns.TypeA) {
+						r := x.(indns.RecordA)
 						replyMsg.Answer = append(replyMsg.Answer, &dns.A{
 							Hdr: dns.RR_Header{
 								Name:   name,
@@ -240,9 +300,9 @@ func handle(w dns.ResponseWriter, questMsg *dns.Msg, resolver Resolver, soa *SOA
 						})
 					}
 
-				case naming.TypeAAAA:
-					if replyType(&q, dns.TypeAAAA) {
-						r := x.(naming.RecordAAAA)
+				case indns.TypeAAAA:
+					if replyType(q, dns.TypeAAAA) {
+						r := x.(indns.RecordAAAA)
 						replyMsg.Answer = append(replyMsg.Answer, &dns.AAAA{
 							Hdr: dns.RR_Header{
 								Name:   name,
@@ -254,9 +314,9 @@ func handle(w dns.ResponseWriter, questMsg *dns.Msg, resolver Resolver, soa *SOA
 						})
 					}
 
-				case naming.TypeTXT:
-					if replyType(&q, dns.TypeTXT) {
-						r := x.(naming.RecordTXT)
+				case indns.TypeTXT:
+					if replyType(q, dns.TypeTXT) {
+						r := x.(indns.RecordTXT)
 						replyMsg.Answer = append(replyMsg.Answer, &dns.TXT{
 							Hdr: dns.RR_Header{
 								Name:   name,
@@ -288,9 +348,9 @@ func handle(w dns.ResponseWriter, questMsg *dns.Msg, resolver Resolver, soa *SOA
 			}
 		}
 
-		if transferReq(&q) {
-			// Zone transfer is concluded with repeated SOA record
-			replyMsg.Answer = append(replyMsg.Answer, soaAnswer(&q, soa, serial))
+		// Zone transfer is concluded with repeated SOA record.
+		if transferReq(q) || (q.Qtype == dns.TypeSOA && q.Name == zone && replyMsg.Authoritative) {
+			replyMsg.Answer = append(replyMsg.Answer, soaAnswer(q.Name, soa, serial))
 		}
 
 		replyCode = dns.RcodeSuccess
@@ -298,9 +358,13 @@ func handle(w dns.ResponseWriter, questMsg *dns.Msg, resolver Resolver, soa *SOA
 		replyCode = dns.RcodeNameError
 	}
 
-	// RFC 2308, Section 3: SOA in Authority section for negative answers
-	if negativeAnswer(&replyMsg, replyCode) && soa.authority() {
-		replyMsg.Ns = append(replyMsg.Ns, soaAnswer(&q, soa, serial))
+	if replyMsg.Authoritative {
+		// RFC 2308, Section 3: SOA in Authority section also for negative answers.
+		if negativeAnswer(&replyMsg, replyCode) {
+			replyMsg.Ns = append(replyMsg.Ns, soaAnswer(zone, soa, serial))
+		} else {
+			replyMsg.Ns = append(replyMsg.Ns, nsAnswer(q.Name, soa.NS, soa.TTL))
+		}
 	}
 }
 
@@ -331,14 +395,22 @@ func negativeAnswer(replyMsg *dns.Msg, replyCode int) bool {
 	return replyCode == dns.RcodeNameError || len(replyMsg.Answer) == 0
 }
 
-func soaAnswer(q *dns.Question, soa *SOA, serial uint32) *dns.SOA {
-	if serial == 0 {
-		serial = defaultSerial
+func nsAnswer(name, value string, ttl uint32) *dns.NS {
+	return &dns.NS{
+		Hdr: dns.RR_Header{
+			Name:   name,
+			Rrtype: dns.TypeNS,
+			Class:  dns.ClassINET,
+			Ttl:    ttl,
+		},
+		Ns: value,
 	}
+}
 
+func soaAnswer(name string, soa *SOA, serial uint32) *dns.SOA {
 	return &dns.SOA{
 		Hdr: dns.RR_Header{
-			Name:   q.Name,
+			Name:   name,
 			Rrtype: dns.TypeSOA,
 			Class:  dns.ClassINET,
 			Ttl:    soa.TTL,

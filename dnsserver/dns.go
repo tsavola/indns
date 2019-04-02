@@ -5,7 +5,7 @@
 package dnsserver
 
 import (
-	"github.com/tsavola/acmedns/dns"
+	"github.com/tsavola/indns"
 )
 
 // Resolver can dump host and zone records.  It must be instantaneous.
@@ -15,17 +15,17 @@ type Resolver interface {
 	// unknown node names in known zones should be returned without records.
 	//
 	// The filter parameter selects a single record type, or some records if
-	// dns.TypeANY is specified (see RFC 8482).  Unknown values must be handled
-	// by returning an empty record set.
+	// indns.TypeANY is specified (see RFC 8482).  Unknown values must be
+	// handled by returning an empty record set.
 	//
 	// serial is the current serial number of the node's zone.  It is non-zero
 	// for known zones, and zero if zone wasn't found.
-	ResolveRecords(hostname string, filter dns.RecordType) (node string, rs dns.Records, serial uint32)
+	ResolveRecords(hostname string, filter indns.RecordType) (node, zone string, rs indns.Records, serial uint32)
 
 	// TransferZone copies the contents of a domain.  The apex node must be
-	// first, if present.
+	// first.
 	//
 	// serial is the current serial number of the zone.  It is non-zero if the
 	// zone was found, and zero if not.
-	TransferZone(domain string) (zone []dns.NodeRecords, serial uint32)
+	TransferZone(domain string) (zone []indns.NodeRecords, serial uint32)
 }

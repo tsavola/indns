@@ -9,15 +9,16 @@ package dnszone
 
 import (
 	"context"
+	"errors"
+	"math"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/tsavola/acmedns/dns"
+	"github.com/tsavola/indns"
 )
 
-// Container of zones.  Implements acmedns.DNS, autocert.DNS, and
-// dnsserver.Resolver.
+// Container of zones.
 type Container struct {
 	mutex sync.RWMutex
 	zones []*Zone
@@ -42,23 +43,49 @@ func InitWithSerial(serial uint32, zones ...*Zone) *Container {
 	}
 }
 
+// Hosts lists fully-qualified-but-without-dot-suffix domain names of
+// addressable nodes.  Wildcard entries are included as such
+// (e.g. "*.example.net").
+func (c *Container) Hosts() []string {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	var hosts []string
+
+	for _, z := range c.zones {
+		domain := strings.TrimSuffix(z.Domain, ".")
+		for node, rs := range z.Nodes {
+			if rs.Addressable() {
+				host := domain
+				if node != indns.Apex {
+					host = node + "." + host
+				}
+				hosts = append(hosts, host)
+			}
+		}
+	}
+
+	return hosts
+}
+
 // ResolveRecords answers ANY queries by returning A and AAAA records.
-func (c *Container) ResolveRecords(name string, filter dns.RecordType) (node string, results dns.Records, serial uint32) {
+func (c *Container) ResolveRecords(fqdn string, filter indns.RecordType) (zone, node string, results indns.Records, serial uint32) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
 	for _, z := range c.zones {
-		node = z.matchResource(name)
+		node = z.matchResource(fqdn)
 		if node != "" {
 			if rs := z.resolveNode(node); rs != nil {
 				switch filter {
-				case dns.TypeANY:
+				case indns.TypeANY:
 					results = resolveANYRecords(rs)
 
 				default:
 					results = resolveRecordType(rs, filter)
 				}
 			}
+			zone = z.Domain
 			serial = z.serial
 			return
 		}
@@ -67,51 +94,53 @@ func (c *Container) ResolveRecords(name string, filter dns.RecordType) (node str
 	return
 }
 
-func resolveRecordType(rs dns.Records, t dns.RecordType) dns.Records {
+func resolveRecordType(rs indns.Records, t indns.RecordType) indns.Records {
+	results := make(indns.Records, 0, len(rs))
 	for _, r := range rs {
 		if r.Type() == t {
-			return dns.Records{r.DeepCopy()}
-		}
-	}
-	return nil
-}
-
-func resolveANYRecords(rs dns.Records) dns.Records {
-	results := make(dns.Records, 0, 2)
-	for _, r := range rs {
-		switch r.Type() {
-		case dns.TypeA, dns.TypeAAAA:
 			results = append(results, r.DeepCopy())
 		}
 	}
 	return results
 }
 
-func (c *Container) ResolveZone(ctx context.Context, hostname string) (domain string, err error) {
+func resolveANYRecords(rs indns.Records) indns.Records {
+	results := make(indns.Records, 0, len(rs))
+	for _, r := range rs {
+		switch r.Type() {
+		case indns.TypeA, indns.TypeAAAA:
+			results = append(results, r.DeepCopy())
+		}
+	}
+	return results
+}
+
+// ResolveZone checks the existence of a zone.  It's ok if the zone exists but
+// the node is unknown: the relative node name is still returned.
+//
+// Successful check of a nonexistent zone returns an error with a NotExist()
+// method which returns true.
+func (c *Container) ResolveZone(ctx context.Context, fqdn string) (zone, node string, err error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	var zoneFound bool
-
 	for _, z := range c.zones {
-		if node := z.matchResource(hostname); node != "" {
-			zoneFound = true
-			if z.resolveNode(node) != nil {
-				domain = z.Domain
-				return
-			}
+		node = z.matchResource(fqdn)
+		if node != "" {
+			zone = z.Domain
+			return
 		}
 	}
 
-	if zoneFound {
-		err = newNodeError(hostname)
-	} else {
-		err = newZoneError(hostname)
-	}
+	err = newZoneError(fqdn)
 	return
 }
 
-func (c *Container) TransferZone(name string) (results []dns.NodeRecords, serial uint32) {
+// TransferZone copies the contents of a domain.  The apex will be the first
+// node.  serial is the current serial number of the zone.
+//
+// Zero values are returned if the zone is not found.
+func (c *Container) TransferZone(name string) (results []indns.NodeRecords, serial uint32) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
@@ -126,17 +155,37 @@ func (c *Container) TransferZone(name string) (results []dns.NodeRecords, serial
 	return
 }
 
-// ModifyTXTRecord implements the focused acmedns.DNS interface.
-func (c *Container) ModifyTXTRecord(ctx context.Context, zone, node string, values []string, ttl uint32) error {
-	return c.ModifyRecord(ctx, zone, node, dns.RecordTXT{Values: values, TTL: ttl})
+// ModifyTXTRecord is a high-level interface for creating, updating or removing
+// a TXT record.  It blocks until the modification is complete or the context
+// is done.
+func (c *Container) ModifyTXTRecord(ctx context.Context, fqdn string, values []string, ttl int) error {
+	if ttl <= 0 || ttl > math.MaxInt32 {
+		return errors.New("TTL value is invalid")
+	}
+
+	zone, node, err := c.ResolveZone(ctx, fqdn)
+	if err != nil {
+		return err
+	}
+
+	return c.ModifyRecord(ctx, zone, node, indns.RecordTXT{Values: values, TTL: uint32(ttl)})
 }
 
-// ForgetTXTRecord implements the focused acmedns.DNS interface.
-func (c *Container) ForgetTXTRecord(zone, node string) error {
-	return c.ForgetRecord(zone, node, dns.TypeTXT)
+// ForgetTXTRecord is a high-level interface for removing a TXT record.  It
+// doesn't wait for the modification to be complete.  The record will disappear
+// at some point in the future.
+func (c *Container) ForgetTXTRecord(fqdn string) error {
+	zone, node, err := c.ResolveZone(context.Background(), fqdn)
+	if err != nil {
+		return nil
+	}
+
+	return c.ForgetRecord(zone, node, indns.TypeTXT)
 }
 
-func (c *Container) ModifyRecord(ctx context.Context, zoneName, node string, r dns.Record) error {
+// ModifyRecord creates, updates or removes a record.  It blocks until the
+// modification is complete or the context is done.
+func (c *Container) ModifyRecord(ctx context.Context, zoneName, node string, r indns.Record) error {
 	c.mutex.Lock()
 
 	var targetZone *Zone
@@ -174,8 +223,9 @@ func (c *Container) ModifyRecord(ctx context.Context, zoneName, node string, r d
 	}
 }
 
-// ForgetRecord is non-blocking ModifyRecord with zero-value record.
-func (c *Container) ForgetRecord(zoneName, node string, rt dns.RecordType) error {
+// ForgetRecord is non-blocking ModifyRecord with zero-value record.  The
+// record will disappear at an unspecified time in the future.
+func (c *Container) ForgetRecord(zoneName, node string, rt indns.RecordType) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -222,7 +272,7 @@ func (c *Container) applyChanges() {
 // resolving resources or transferring zones.
 type Zone struct {
 	Domain string
-	Nodes  map[string]dns.Records
+	Nodes  map[string]indns.Records
 
 	serial uint32 // managed by Container
 }
@@ -230,48 +280,45 @@ type Zone struct {
 func (z *Zone) matchResource(name string) (node string) {
 	switch {
 	case z.Domain == name:
-		node = dns.Apex
+		node = indns.Apex
 
 	case strings.HasSuffix(name, "."+z.Domain):
-		prefix := name[:len(name)-1-len(z.Domain)]
-		if !strings.Contains(prefix, ".") {
-			node = prefix
-		}
+		node = name[:len(name)-1-len(z.Domain)]
 	}
 
 	return
 }
 
-func (z *Zone) resolveNode(node string) (rs dns.Records) {
+func (z *Zone) resolveNode(node string) (rs indns.Records) {
 	rs = z.Nodes[node]
-	if rs == nil && node != dns.Apex { // wildcard doesn't apply to apex
-		rs = z.Nodes[dns.Wildcard]
+	if rs == nil && node != indns.Apex { // wildcard doesn't apply to apex
+		rs = z.Nodes[indns.Wildcard]
 	}
 	return
 }
 
-func (z *Zone) transfer() (results []dns.NodeRecords) {
-	results = make([]dns.NodeRecords, 0, len(z.Nodes))
+func (z *Zone) transfer() (results []indns.NodeRecords) {
+	results = make([]indns.NodeRecords, 0, len(z.Nodes))
 
-	if rs := z.Nodes[dns.Apex]; rs != nil {
-		results = append(results, dns.NodeRecords{
-			Name:    dns.Apex,
+	if rs := z.Nodes[indns.Apex]; rs != nil {
+		results = append(results, indns.NodeRecords{
+			Name:    indns.Apex,
 			Records: rs.DeepCopy(),
 		})
 	}
 
 	for name, rs := range z.Nodes {
-		if name != dns.Apex && name != dns.Wildcard {
-			results = append(results, dns.NodeRecords{
+		if name != indns.Apex && name != indns.Wildcard {
+			results = append(results, indns.NodeRecords{
 				Name:    name,
 				Records: rs.DeepCopy(),
 			})
 		}
 	}
 
-	if rs := z.Nodes[dns.Wildcard]; rs != nil {
-		results = append(results, dns.NodeRecords{
-			Name:    dns.Wildcard,
+	if rs := z.Nodes[indns.Wildcard]; rs != nil {
+		results = append(results, indns.NodeRecords{
+			Name:    indns.Wildcard,
 			Records: rs.DeepCopy(),
 		})
 	}
@@ -279,10 +326,10 @@ func (z *Zone) transfer() (results []dns.NodeRecords) {
 	return
 }
 
-func (z *Zone) modifyRecord(node string, rt dns.RecordType, r dns.Record) {
+func (z *Zone) modifyRecord(node string, rt indns.RecordType, r indns.Record) {
 	if r != nil && !r.IsZero() {
 		if z.Nodes == nil {
-			z.Nodes = make(map[string]dns.Records)
+			z.Nodes = make(map[string]indns.Records)
 		}
 
 		rs := z.Nodes[node]

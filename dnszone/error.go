@@ -8,10 +8,7 @@ import (
 	"net"
 )
 
-const (
-	// Try to be informative without being misleading in an unexpected context.
-	resolver = "acmedns/dns/dnszone"
-)
+const resolver = "indns/dnszone"
 
 type existenceError struct {
 	net.DNSError
@@ -25,16 +22,6 @@ func newZoneError(name string) error {
 	return &existenceError{
 		DNSError: net.DNSError{
 			Err:    "DNS zone is unknown",
-			Name:   name,
-			Server: resolver,
-		},
-	}
-}
-
-func newNodeError(name string) error {
-	return &existenceError{
-		DNSError: net.DNSError{
-			Err:    "Node not found in DNS zone",
 			Name:   name,
 			Server: resolver,
 		},
