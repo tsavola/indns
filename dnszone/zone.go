@@ -186,6 +186,10 @@ func (c *Container) ForgetTXTRecord(fqdn string) error {
 // ModifyRecord creates, updates or removes a record.  It blocks until the
 // modification is complete or the context is done.
 func (c *Container) ModifyRecord(ctx context.Context, zoneName, node string, r indns.Record) error {
+	return c.modifyRecord(ctx, zoneName, node, r, false)
+}
+
+func (c *Container) modifyRecord(ctx context.Context, zoneName, node string, r indns.Record, strict bool) error {
 	c.mutex.Lock()
 
 	var targetZone *Zone
@@ -199,14 +203,21 @@ func (c *Container) ModifyRecord(ctx context.Context, zoneName, node string, r i
 
 	if targetZone != nil {
 		// Modify zone immediately without changing serial number.
-		targetZone.modifyRecord(node, r.Type(), r)
+		modified := targetZone.modifyRecord(node, r.Type(), r, strict)
 
 		// Coalesce all serial number changes over a one-second period, and
 		// increment each zone's serial number just once at the end of that
 		// period.  That way they don't run ahead of Serial().
-		ready := c.scheduleChange(targetZone)
+		var ready <-chan struct{}
+		if modified {
+			ready = c.scheduleChange(targetZone)
+		}
 
 		c.mutex.Unlock()
+
+		if !modified {
+			return errors.New("record already exists")
+		}
 
 		// Block until the serial number change is visible.
 		select {
@@ -226,19 +237,27 @@ func (c *Container) ModifyRecord(ctx context.Context, zoneName, node string, r i
 // ForgetRecord is non-blocking ModifyRecord with zero-value record.  The
 // record will disappear at an unspecified time in the future.
 func (c *Container) ForgetRecord(zoneName, node string, rt indns.RecordType) error {
+	_, err := c.forgetRecord(zoneName, node, rt)
+	return err
+}
+
+func (c *Container) forgetRecord(zoneName, node string, rt indns.RecordType) (bool, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	for _, z := range c.zones {
 		if z.Domain == zoneName {
-			// See the comments in ModifyRecord.
-			z.modifyRecord(node, rt, nil)
-			c.scheduleChange(z)
-			return nil
+			// See the comments in Container.modifyRecord.
+			if z.modifyRecord(node, rt, nil, true) {
+				c.scheduleChange(z)
+				return true, nil
+			} else {
+				return false, nil
+			}
 		}
 	}
 
-	return newZoneError(zoneName)
+	return false, newZoneError(zoneName)
 }
 
 // scheduleChange must be called with write lock held.
@@ -326,7 +345,7 @@ func (z *Zone) transfer() (results []indns.NodeRecords) {
 	return
 }
 
-func (z *Zone) modifyRecord(node string, rt indns.RecordType, r indns.Record) {
+func (z *Zone) modifyRecord(node string, rt indns.RecordType, r indns.Record, strict bool) bool {
 	if r != nil && !r.IsZero() {
 		if z.Nodes == nil {
 			z.Nodes = make(map[string]indns.Records)
@@ -335,11 +354,16 @@ func (z *Zone) modifyRecord(node string, rt indns.RecordType, r indns.Record) {
 		rs := z.Nodes[node]
 		for i, x := range rs {
 			if x.Type() == rt {
-				rs[i] = r
-				return
+				if strict {
+					return false
+				} else {
+					rs[i] = r
+					return true
+				}
 			}
 		}
 		z.Nodes[node] = append(rs, r)
+		return true
 	} else {
 		rs := z.Nodes[node]
 		for i, x := range rs {
@@ -350,9 +374,11 @@ func (z *Zone) modifyRecord(node string, rt indns.RecordType, r indns.Record) {
 				} else {
 					delete(z.Nodes, node)
 				}
-				return
+				return true
 			}
 		}
+
+		return false
 	}
 }
 
